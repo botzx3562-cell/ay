@@ -1,17 +1,19 @@
-name: RDP
+name: RDP-24-7
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # كل 5 ساعات - إعادة تشغيل تلقائية
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 330  # 5.5 ساعة (قبل الحد الأقصى 6 ساعات)
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          # فعّل Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,25 +21,23 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
+          # حذف القواعس القديمة وإضافة قاعدة جديدة
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # إعادة تشغيل خدمة RDP
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+                         [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -46,68 +46,99 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # إنشاء المستخدم (تجاهل الخطأ لو كان موجود)
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          echo "RDP_CREDS=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "✅ User RDP created successfully"
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # تحقق لو كان مثبت
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+              Start-Sleep -Seconds 5
+              Write-Host "✅ Tailscale installed"
+          } else {
+              Write-Host "✅ Tailscale already installed"
+          }
 
-      - name: Establish Tailscale Connection
+      - name: Establish Tailscale Connection (IP ثابت)
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # استخدم hostname ثابت = IP ثابت
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-rdp-permanent `
+            --force-reauth
           
-          # Wait for Tailscale to assign an IP
+          Start-Sleep -Seconds 10
+          
+          # احصل على الـ IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "❌ Tailscale IP not assigned"
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale Connected - IP: $tsIP"
       
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "❌ TCP connection failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "✅ TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Display Connection Info
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host ""
+          Write-Host "╔════════════════════════════════════════════╗"
+          Write-Host "║       ✅ RDP جاهز للاتصال الآن!            ║"
+          Write-Host "╚════════════════════════════════════════════╝"
+          Write-Host ""
+          Write-Host "📍 IP Address:    $env:TAILSCALE_IP"
+          Write-Host "🔌 Port:          3389"
+          Write-Host "👤 Username:      RDP"
+          Write-Host "🔑 Password:      $env:RDP_CREDS"
+          Write-Host ""
+          Write-Host "⏱️  المدة: 5.5 ساعات"
+          Write-Host "🔄 إعادة تشغيل تلقائية كل 5 ساعات"
+          Write-Host ""
+
+      - name: Maintain Connection (5.5 hours)
+        run: |
+          $endTime = (Get-Date).AddMinutes(330)
+          $counter = 0
           
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+          while ((Get-Date) -lt $endTime) {
+              $counter++
+              $elapsed = [int]((Get-Date) - (Get-Date).AddMinutes(-330)).TotalMinutes
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active ($counter cycles)"
               Start-Sleep -Seconds 300
           }
+          
+          Write-Host ""
+          Write-Host "⏰ انتهت جلسة العمل - سيتم إعادة التشغيل تلقائياً..."
+          Write-Host ""
